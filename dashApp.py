@@ -1,198 +1,307 @@
 import dash
-import os
 from dash import dcc, html, Input, Output, State
-import dash_bootstrap_components as dbc
-from dash.dependencies import ALL
+import plotly.express as px
 import pandas as pd
-import numpy as np
-from sklearn.linear_model import Ridge
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.preprocessing import StandardScaler, OneHotEncoder, PolynomialFeatures
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-import base64
 import io
+import base64
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score
+from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.impute import SimpleImputer
+import numpy as np
 
-# Initialize Dash app
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
-server = app.server  # Expose server for Gunicorn
-app.title = "Polynomial Ridge Regression App"
+#create dash app
+app = dash.Dash(__name__)
+app.title = "Milestone 4"
 
-# Global variables
-uploaded_data = None
-model_pipeline = None
-
-# Layout
-app.layout = dbc.Container([
-    html.H1("Polynomial Ridge Regression App", className="text-center mb-4"),
-    
-    # Upload Dataset
+#layout
+app.layout = html.Div([
+    #upload part
     html.Div([
-        html.H3("Upload Dataset (CSV)", className="mt-3"),
+        html.Label("Upload File"),
         dcc.Upload(
             id='upload-data',
-            children=html.Div(['Drag and Drop or ', html.A('Select File')]),
+            children=html.Div(['Drag and Drop or ', html.A('Select Files')]),
             style={
                 'width': '100%', 'height': '60px', 'lineHeight': '60px',
                 'borderWidth': '1px', 'borderStyle': 'dashed',
                 'borderRadius': '5px', 'textAlign': 'center', 'margin': '10px'
             },
-        ),
-        html.Div(id='output-data-upload', className="mt-2"),
+            multiple=False
+        )
     ]),
-    
-    # Select Target Variable
-    html.Div([
-        html.H3("Select Target Variable"),
-        dcc.Dropdown(id='target-dropdown', placeholder="Select Target Variable"),
-    ], className="mt-4"),
-    
-    # Train Model
-    html.Div([
-        html.H3("Train Polynomial Ridge Regression Model"),
-        html.Div(id='feature-checkboxes', className="mt-3"),
-        html.Button('Train Model', id='train-button', n_clicks=0, className="btn btn-primary mt-3"),
-        html.Div(id='model-score', className="mt-3"),
-    ], className="mt-4"),
-    
-    # Predict
-    html.Div([
-        html.H3("Predict Target Variable"),
-        dcc.Input(id='predict-input', type='text', placeholder="Enter feature values, separated by commas"),
-        html.Button('Predict', id='predict-button', n_clicks=0, className="btn btn-success mt-3"),
-        html.Div(id='prediction-result', className="mt-3"),
-    ], className="mt-4"),
-], fluid=True)
+    html.Div(id='upload-status', style={'color': 'green', 'margin': '10px'}),
 
-# Callbacks
+    #select Target part
+    html.Div([
+        html.Label("Select Target:"),
+        dcc.Dropdown(
+            id='select-target',
+            placeholder="Select the target variable"
+        )
+    ], style={'margin': '10px'}),
+
+    #bar chart section
+    html.Div([
+        dcc.RadioItems(id='select-categorical', style={'margin': '10px', 'display': 'flex', 'flexDirection': 'row'}),
+
+        html.Div([
+            dcc.Graph(id='barchart-average'),
+            dcc.Graph(id='barchart-correlation')
+        ], style={'display': 'flex', 'justifyContent': 'space-between', 'gap': '20px'})
+    ], style={'margin': '10px'}),
+
+    #hidden div to store df
+    dcc.Store(id='stored-data'),
+
+    #train component with loading
+    html.Div([
+        html.Label("Select Features:"),
+        dcc.Checklist(id='feature-checkboxes', style={'margin': '10px'}),
+        html.Button("Train Model", id='train-button', n_clicks=0, style={'margin': '10px'}),
+        dcc.Loading(
+            id='train-loading',
+            type='default',
+            children=html.Div(id='train-output', style={'color': 'blue', 'margin': '10px'})
+        )
+    ], style={'margin': '20px'}),
+
+    #prediction component
+    html.Div([
+        html.Label("Enter Feature Values for Prediction (In the Feature Checklist order, Seperate with commas):"),
+        dcc.Input(id='prediction-input-textbox', type='text', placeholder="example with 2 var: 10,10"),
+        html.Button("Predict", id='predict-button', n_clicks=0, style={'margin': '10px'}),
+        html.Div(id='prediction-output', style={'color': 'blue', 'margin': '10px'})
+    ], style={'margin': '20px'})
+])
+
+#handle conversion of numeric columns written categorically to numerical
+def convert_words_to_numbers(df):
+    labels = {'zero': 0, 'one': 1, 'two': 2, 'three': 3, 'four': 4,
+              'five': 5, 'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10}
+
+    for col in df.select_dtypes(include=['object']).columns:
+        if df[col].str.lower().isin(labels.keys()).any():
+            df[col] = df[col].str.lower().map(labels).fillna(df[col])
+    return df
+
+#file upload
 @app.callback(
-    [Output('output-data-upload', 'children'),
-     Output('target-dropdown', 'options')],
+    [Output('stored-data', 'data'), Output('upload-status', 'children')],
     Input('upload-data', 'contents'),
     State('upload-data', 'filename')
 )
-def upload_file(contents, filename):
-    global uploaded_data
-    if contents:
-        content_type, content_string = contents.split(',')
-        decoded = base64.b64decode(content_string)
-        try:
-            uploaded_data = pd.read_csv(io.StringIO(decoded.decode('utf-8')))
-            numerical_vars = uploaded_data.select_dtypes(include=['number']).columns.tolist()
-            return (
-                f"Uploaded {filename} successfully!",
-                [{'label': col, 'value': col} for col in numerical_vars]
-            )
-        except Exception as e:
-            return f"Error: {e}", []
-    return "No file uploaded yet.", []
+def handle_file_upload(contents, filename):
+    if contents is None:
+        return dash.no_update, ""
 
+    #decodes uploaded file
+    content_type, content_string = contents.split(',')
+    decoded = base64.b64decode(content_string)
+    try:
+        #csv to df
+        df = pd.read_csv(io.StringIO(decoded.decode('utf-8')))
+        df = convert_words_to_numbers(df)  # convert words to numeric if needed
+        return df.to_dict('records'), f"Successfully uploaded: {filename}"
+    except Exception as e:
+        return dash.no_update, f"Error processing file: {str(e)}"
+
+#updates select target dropdown based on csv
 @app.callback(
-    Output('feature-checkboxes', 'children'),
-    Input('target-dropdown', 'value')
+    Output('select-target', 'options'),
+    Input('stored-data', 'data')
 )
-def update_feature_checkboxes(target_var):
-    if target_var:
-        feature_options = [col for col in uploaded_data.columns if col != target_var]
-        return [
-            dbc.Checkbox(
-                id={'type': 'feature', 'index': i},  # Properly formatted ID
-                label=col,
-                value=True,
-                style={'margin': '5px'}
-            ) for i, col in enumerate(feature_options)
-        ]
-    return []
+def update_dropdown(data):
+    if data is None:
+        return []
+
+    df = pd.DataFrame(data)
+
+    #gets the numeric columns
+    numeric_columns = df.select_dtypes(include=['number']).columns
+    return [{'label': col, 'value': col} for col in numeric_columns]
+
+#updates radio buttons for categorical variables and bar charts
+@app.callback(
+    [Output('select-categorical', 'options'),
+     Output('barchart-average', 'figure'),
+     Output('barchart-correlation', 'figure')],
+    [Input('select-target', 'value'),
+     Input('select-categorical', 'value')],
+    State('stored-data', 'data')
+)
+def update_barcharts(target, categorical, data):
+    if data is None or target is None:
+        return [], {}, {}
+
+    df = pd.DataFrame(data)
+
+    # Hardcode preprocessing to treat specific columns as categorical
+    df['New Regulations Impacting Aerodynamics'] = df['New Regulations Impacting Aerodynamics'].astype('category')
+    df['DRS'] = df['DRS'].astype('category')
+    df['Season'] = df['Season'].astype('category')
+
+    # Identify categorical columns
+    categorical_columns = df.select_dtypes(include=['object', 'category']).columns
+
+    #default empty figures
+    fig_avg = {}
+    fig_corr = {}
+
+    #average of target variable by categorical variable
+    if categorical and categorical in categorical_columns:
+        avg_values = df.groupby(categorical)[target].mean().reset_index()
+        fig_avg = px.bar(avg_values, x=categorical, y=target, title=f"Average {target} by {categorical}", text_auto=True)
+        fig_avg.update_layout(yaxis_title=f"{target} (average)")
+
+    #correlation strength of numerical variables with target variable
+    numeric_columns = df.select_dtypes(include=['number']).columns
+    numeric_columns = [col for col in numeric_columns if col != target]  # Exclude target variable
+    correlations = df[numeric_columns].corrwith(df[target]).abs().sort_values(ascending=False).reset_index()
+    correlations = correlations.rename(columns={0: 'Correlation Strength (Absolute Value)', 'index': 'Numerical Variables'})
+    fig_corr = px.bar(correlations, x='Numerical Variables', y='Correlation Strength (Absolute Value)', title=f"Correlation Strength of Numerical Variables with {target}", text_auto=True)
+
+    return [{'label': col, 'value': col} for col in categorical_columns], fig_avg, fig_corr
+
+#Callback to populate feature checkboxes based on dataset
+@app.callback(
+    Output('feature-checkboxes', 'options'),
+    Input('stored-data', 'data')
+)
+def update_feature_checkboxes(data):
+    if data is None:
+        return []
+
+    df = pd.DataFrame(data)
+
+    #select only numerical columns
+    numerical_features = df.select_dtypes(include=['number']).columns
+
+    return [{'label': col, 'value': col} for col in numerical_features]
+
 
 @app.callback(
-    Output('model-score', 'children'),
+    Output('train-output', 'children'),
     Input('train-button', 'n_clicks'),
-    State('target-dropdown', 'value'),
-    State({'type': 'feature', 'index': ALL}, 'value')
+    State('stored-data', 'data'),
+    State('feature-checkboxes', 'value'),
+    State('select-target', 'value')
 )
-def train_model(n_clicks, target_var, feature_values):
-    global model_pipeline
-    if n_clicks > 0 and target_var:
-        selected_features = [col for col, val in zip(uploaded_data.columns, feature_values) if val]
-        if not selected_features:
-            return "Error: Please select at least one feature."
-        
-        # Prepare dataset
-        X = uploaded_data[selected_features]
-        y = uploaded_data[target_var]
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+def train_model(n_clicks, data, selected_features, target):
+    global trained_model, selected_features_final  #make the model and features globally accessible
 
-        # Preprocessing pipeline
-        numerical_features = X.select_dtypes(include=['number']).columns.tolist()
-        categorical_features = X.select_dtypes(include=['object']).columns.tolist()
+    if n_clicks == 0:
+        return "Click 'Train Model' to start."
 
-        preprocessor = ColumnTransformer(transformers=[
-            ('num', StandardScaler(), numerical_features),
-            ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features)
-        ])
-        
-        # Polynomial Ridge Regression
-        poly = PolynomialFeatures(degree=2, include_bias=False)
-        ridge_params = {'alpha': [0.1, 1, 10, 100, 1000]}
-        ridge = Ridge()
-        model_pipeline = Pipeline(steps=[
+    if data is None:
+        return "Please upload a dataset first."
+
+    if not selected_features:
+        return "Please select at least one feature."
+
+    if target is None:
+        return "Please select a target variable."
+
+    try:
+        df = pd.DataFrame(data)
+
+        if target not in df.columns:
+            return f"The selected target variable '{target}' is not in the dataset."
+
+        if any(feature not in df.columns for feature in selected_features):
+            return "One or more selected features are not in the dataset."
+
+        #define X and y
+        X = df[selected_features]
+        y = df[target]
+
+        #train-test split
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, random_state=42)
+
+        #preprocessor for categorical and numerical features
+        categorical_features = X.select_dtypes(include=['object', 'category']).columns
+        numerical_features = X.select_dtypes(include=['number']).columns
+
+        preprocessor = ColumnTransformer(
+            transformers=[ 
+                ('num', SimpleImputer(strategy='mean'), numerical_features),
+                ('cat', Pipeline(steps=[
+                    ('imputer', SimpleImputer(strategy='most_frequent')),
+                    ('onehot', OneHotEncoder(handle_unknown='ignore'))
+                ]), categorical_features)
+            ]
+        )
+
+        #define the pipeline
+        pipeline = Pipeline([
             ('preprocessor', preprocessor),
-            ('poly', poly),
-            ('ridge_cv', GridSearchCV(ridge, ridge_params, cv=5, scoring='r2'))
+            ('feature_selection', SelectKBest(score_func=f_regression)),
+            ('regressor', RandomForestRegressor(random_state=15))
         ])
-        
-        # Train model
-        model_pipeline.fit(X_train, y_train)
 
-        # Model evaluation
-        best_ridge = model_pipeline.named_steps['ridge_cv'].best_estimator_
-        X_test_poly = poly.transform(preprocessor.transform(X_test))
-        y_pred = best_ridge.predict(X_test_poly)
+        #define hyperparameter grid
+        param_grid = {
+            'feature_selection__k': [min(2, len(selected_features)), len(selected_features)],
+            'regressor__n_estimators': [100, 200],
+            'regressor__max_depth': [10, 20],
+            'regressor__min_samples_split': [2, 5],
+            'regressor__min_samples_leaf': [1, 2]
+        }
 
+        #perform GridSearchCV
+        grid_search = GridSearchCV(estimator=pipeline, param_grid=param_grid, cv=3, scoring='r2', verbose=0, n_jobs=-1)
+        grid_search.fit(X_train, y_train)
+
+        #evaluate the model
+        trained_model = grid_search.best_estimator_  #save the trained model globally
+        y_pred = trained_model.predict(X_test)
         r2 = r2_score(y_test, y_pred)
-        mae = mean_absolute_error(y_test, y_pred)
-        try:
-            # Calculate RMSE
-            rmse = mean_squared_error(y_test, y_pred, squared=False)  # Requires scikit-learn >= 0.22
-        except TypeError:
-            # Fallback for older versions
-            mse = mean_squared_error(y_test, y_pred)
-            rmse = mse ** 0.5
 
-        return f"Model trained with R²: {r2:.4f}, MAE: {mae:.4f}, RMSE: {rmse:.4f}"
-    return "No model trained yet."
+        selected_features_final = np.array(selected_features)[
+            trained_model.named_steps['feature_selection'].get_support()]
 
+        return [
+            f"Model trained successfully! R² Score: {r2:.5f}",
+            html.Br()]
+    except Exception as e:
+        return f"An error occurred during training: {str(e)}"
+
+#predictor
 @app.callback(
-    Output('prediction-result', 'children'),
+    Output('prediction-output', 'children'),
     Input('predict-button', 'n_clicks'),
-    State('predict-input', 'value')
+    State('feature-checkboxes', 'value'),
+    State('select-target', 'value'),
+    State('prediction-input-textbox', 'value')
 )
-def predict_value(n_clicks, input_values):
-    if n_clicks > 0 and input_values:
-        try:
-            # Parse the input values into a numpy array
-            input_data = np.array([float(val) for val in input_values.split(',')]).reshape(1, -1)
-            
-            # Ensure input is in a DataFrame format with appropriate column names
-            selected_features = [col for col in uploaded_data.columns if col != 'Season' and col != 'Overtakes']
-            input_df = pd.DataFrame(input_data, columns=selected_features)
-            
-            # Preprocess input using the pipeline
-            preprocessed_input = model_pipeline.named_steps['preprocessor'].transform(input_df)
-            
-            # Apply polynomial features
-            poly_input = model_pipeline.named_steps['poly'].transform(preprocessed_input)
+def predict_value(n_clicks, selected_features, target, input_values):
+    if n_clicks == 0:
+        return "Enter feature values and click 'Predict'."
 
-            # Predict using the trained model
-            best_ridge = model_pipeline.named_steps['ridge_cv'].best_estimator_
-            prediction = best_ridge.predict(poly_input)
+    if not selected_features or trained_model is None:
+        return "Please train a model first."
 
-            return f"Predicted Target Value: {prediction[0]:.2f}"
-        except Exception as e:
-            return f"Error: {e}"
-    return "No prediction made yet."
+    try:
+        if not input_values:
+            return "Please enter the feature values."
 
-# Run the app
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+        input_values = [float(val) if val else np.nan for val in input_values.split(',')]
+
+        if len(input_values) != len(selected_features):
+            return f"Please enter {len(selected_features)} values for prediction."
+
+        #get and use the model to predict the value
+        input_df = pd.DataFrame([input_values], columns=selected_features)
+
+        prediction = trained_model.predict(input_df)[0]
+
+        return f"The predicted value of {target} is: {prediction:.2f}"
+    except Exception as e:
+        return f"Error in prediction: {str(e)}"
+
+if __name__ == '__main__':
+    app.run_server(debug=True)
